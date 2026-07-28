@@ -25,22 +25,48 @@ ARG GID=0
 
 ######## WebUI frontend ########
 FROM --platform=$BUILDPLATFORM node:22-alpine3.20 AS build
-ARG BUILD_HASH
 
 # Set Node.js options (heap limit Allocation failed - JavaScript heap out of memory)
 # ENV NODE_OPTIONS="--max-old-space-size=4096"
 
 WORKDIR /app
 
-# to store git revision in build
-RUN apk add --no-cache git
-
 COPY package.json package-lock.json ./
-RUN npm ci --force
+# onnxruntime-node otherwise assumes CUDA 12 on Linux x64 and downloads GPU
+# binaries that are neither needed to build the frontend nor copied to runtime.
+RUN --mount=type=cache,target=/root/.npm \
+    ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm ci --force
 
-COPY . .
+# Backend and Python metadata change independently from the frontend bundle.
+COPY --exclude=backend --exclude=backend/** \
+    --exclude=pyproject.toml --exclude=uv.lock . .
+ARG BUILD_HASH
+ARG BUILD_SOURCEMAPS=false
 ENV APP_BUILD_HASH=${BUILD_HASH}
-RUN npm run build
+ENV BUILD_SOURCEMAPS=${BUILD_SOURCEMAPS}
+# Reuse downloaded Pyodide assets across frontend source changes.
+RUN --mount=type=cache,target=/root/.cache/pyodide,sharing=locked \
+    mkdir -p static/pyodide && \
+    cp -a /root/.cache/pyodide/. static/pyodide/ && \
+    npm run build && \
+    find /root/.cache/pyodide -mindepth 1 -delete && \
+    cp -a static/pyodide/. /root/.cache/pyodide/
+
+COPY ./backend /app/backend
+
+# The backend rewrites its bundled static assets (favicons, splash, manifest,
+# loader.js, ...) under open_webui/static at startup. Make that directory
+# writable by an arbitrary UID -- which under OpenShift's restricted SCC is
+# always a member of GID 0 -- so those writes don't fail with EACCES and crash
+# the boot log with "[Errno 13] Permission denied". `chmod -R g=u` mirrors the
+# owner bits onto the group (the Red Hat arbitrary-UID idiom). Do this in a
+# build stage so the permission change does not duplicate the static assets in
+# the final image.
+ARG UID
+ARG GID
+RUN chown -R $UID:$GID /app/backend && \
+    chgrp -R 0 /app/backend/open_webui/static && \
+    chmod -R g=u /app/backend/open_webui/static
 
 ######## WebUI backend ########
 FROM python:3.11-slim-bookworm AS base
@@ -56,6 +82,7 @@ ARG USE_RERANKING_MODEL
 ARG USE_AUXILIARY_EMBEDDING_MODEL
 ARG UID
 ARG GID
+ARG TARGETARCH
 
 # Python settings
 ENV PYTHONUNBUFFERED=1
@@ -109,6 +136,55 @@ ENV HF_HOME="/app/backend/data/cache/embedding/models"
 WORKDIR /app/backend
 
 ENV HOME=/root
+# Prevent 0-byte file corruption in QEMU arm64 cross-builds.
+ENV UV_LINK_MODE=copy
+
+######## Python dependency builder ########
+FROM base AS python-deps
+
+# Isolate dependency compilation from runtime package installation.
+RUN --mount=type=cache,id=apt-cache-$TARGETARCH,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=apt-lists-$TARGETARCH,target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential libmariadb-dev python3-dev
+
+COPY ./backend/requirements.txt ./requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/uv \
+    set -e; \
+    pip3 install uv; \
+    if [ "$USE_CUDA" = "true" ]; then \
+    # If you use CUDA the whisper and embedding model will be downloaded on first use
+    # Pin matching packages: torch 2.10.0 causes SIGILL on ARM devices, and
+    # independently resolved companion packages can be ABI-incompatible. #21349
+    pip3 install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/$USE_CUDA_DOCKER_VER; \
+    else \
+    pip3 install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cpu; \
+    fi; \
+    uv pip install --system -r requirements.txt; \
+    pip3 uninstall --yes uv
+
+# Download model assets after dependency installation so later runtime changes
+# do not invalidate the downloads.
+RUN set -e; \
+    mkdir -p /app/backend/data /root/nltk_data; \
+    if [ "$USE_CUDA" = "true" ] || [ "$USE_SLIM" != "true" ]; then \
+    python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ['RAG_EMBEDDING_MODEL'], device='cpu')"; \
+    python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ.get('AUXILIARY_EMBEDDING_MODEL', 'TaylorAI/bge-micro-v2'), device='cpu')"; \
+    python -c "import os; from faster_whisper import WhisperModel; WhisperModel(os.environ['WHISPER_MODEL'], device='cpu', compute_type='int8', download_root=os.environ['WHISPER_MODEL_DIR'])"; \
+    python -c "import os; import tiktoken; tiktoken.get_encoding(os.environ['TIKTOKEN_ENCODING_NAME'])"; \
+    python -c "import nltk; nltk.download('punkt_tab', download_dir='/root/nltk_data')"; \
+    fi; \
+    chown -R $UID:$GID /app/backend/data
+
+######## Runtime image ########
+FROM base AS runtime
+
+ARG USE_RUNTIME_BUILD_DEPS=true
+
 # Create user and group if not root
 RUN if [ $UID -ne 0 ]; then \
     if [ $GID -ne 0 ]; then \
@@ -117,52 +193,29 @@ RUN if [ $UID -ne 0 ]; then \
     adduser --uid $UID --gid $GID --home $HOME --disabled-password --no-create-home app; \
     fi
 
-RUN mkdir -p $HOME/.cache/chroma
-RUN echo -n 00000000-0000-0000-0000-000000000000 > $HOME/.cache/chroma/telemetry_user_id
+RUN mkdir -p $HOME/.cache/chroma && \
+    echo -n 00000000-0000-0000-0000-000000000000 > $HOME/.cache/chroma/telemetry_user_id && \
+    chown -R $UID:$GID /app $HOME
 
-# Make sure the user has access to the app and root directory
-RUN chown -R $UID:$GID /app $HOME
-
-# Install common system dependencies
-RUN apt-get update && \
+# Open WebUI installs tool dependencies at runtime, so keep the compiler and
+# Python headers by default. Fixed deployments can opt out for a smaller image.
+RUN --mount=type=cache,id=apt-cache-$TARGETARCH,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=apt-lists-$TARGETARCH,target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
-    git build-essential pandoc gcc netcat-openbsd curl jq ca-certificates \
-    libmariadb-dev \
-    python3-dev \
+    git pandoc netcat-openbsd curl jq ca-certificates \
     ffmpeg libsm6 libxext6 zstd \
-    && rm -rf /var/lib/apt/lists/*
+    && if [ "$USE_RUNTIME_BUILD_DEPS" = "true" ]; then \
+    apt-get install -y --no-install-recommends \
+    build-essential libmariadb-dev python3-dev; \
+    fi
 
-# install python dependencies
-COPY --chown=$UID:$GID ./backend/requirements.txt ./requirements.txt
-
-# Set UV_LINK_MODE to copy to prevent 0-byte file corruption in QEMU arm64 cross-builds
-ENV UV_LINK_MODE=copy
-
-RUN set -e; \
-    pip3 install --no-cache-dir uv; \
-    if [ "$USE_CUDA" = "true" ]; then \
-    # If you use CUDA the whisper and embedding model will be downloaded on first use
-    # fix: pin torch<=2.9.1 - torch 2.10.0 aarch64 wheels cause SIGILL on ARM devices (RPi 4 Cortex-A72) #21349
-    pip3 install 'torch<=2.9.1' torchvision torchaudio --index-url https://download.pytorch.org/whl/$USE_CUDA_DOCKER_VER --no-cache-dir; \
-    uv pip install --system -r requirements.txt --no-cache-dir; \
-    python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ['RAG_EMBEDDING_MODEL'], device='cpu')"; \
-    python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ.get('AUXILIARY_EMBEDDING_MODEL', 'TaylorAI/bge-micro-v2'), device='cpu')"; \
-    python -c "import os; from faster_whisper import WhisperModel; WhisperModel(os.environ['WHISPER_MODEL'], device='cpu', compute_type='int8', download_root=os.environ['WHISPER_MODEL_DIR'])"; \
-    python -c "import os; import tiktoken; tiktoken.get_encoding(os.environ['TIKTOKEN_ENCODING_NAME'])"; \
-    python -c "import nltk; nltk.download('punkt_tab')"; \
-    else \
-    pip3 install 'torch<=2.9.1' torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --no-cache-dir; \
-    uv pip install --system -r requirements.txt --no-cache-dir; \
-    if [ "$USE_SLIM" != "true" ]; then \
-    python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ['RAG_EMBEDDING_MODEL'], device='cpu')"; \
-    python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ.get('AUXILIARY_EMBEDDING_MODEL', 'TaylorAI/bge-micro-v2'), device='cpu')"; \
-    python -c "import os; from faster_whisper import WhisperModel; WhisperModel(os.environ['WHISPER_MODEL'], device='cpu', compute_type='int8', download_root=os.environ['WHISPER_MODEL_DIR'])"; \
-    python -c "import os; import tiktoken; tiktoken.get_encoding(os.environ['TIKTOKEN_ENCODING_NAME'])"; \
-    python -c "import nltk; nltk.download('punkt_tab')"; \
-    fi; \
-    fi; \
-    mkdir -p /app/backend/data; chown -R $UID:$GID /app/backend/data/; \
-    rm -rf /var/lib/apt/lists/*;
+# Preserve the Python installation prefix so scripts, headers, data files, and
+# package RECORD paths remain consistent with runtime pip operations.
+COPY --from=python-deps /usr/local /usr/local
+COPY --chown=$UID:$GID --from=python-deps /app/backend/data /app/backend/data
+COPY --chown=$UID:$GID --from=python-deps /root/nltk_data /root/nltk_data
 
 # Install Ollama if requested
 RUN if [ "$USE_OLLAMA" = "true" ]; then \
@@ -182,18 +235,12 @@ COPY --chown=$UID:$GID --from=build /app/CHANGELOG.md /app/CHANGELOG.md
 COPY --chown=$UID:$GID --from=build /app/package.json /app/package.json
 
 # copy backend files
-COPY --chown=$UID:$GID ./backend .
+COPY --from=build /app/backend .
 
-# The backend rewrites its bundled static assets (favicons, splash, manifest,
-# loader.js, ...) under open_webui/static at startup. Make that directory
-# writable by an arbitrary UID -- which under OpenShift's restricted SCC is
-# always a member of GID 0 -- so those writes don't fail with EACCES and crash
-# the boot log with "[Errno 13] Permission denied". `chmod -R g=u` mirrors the
-# owner bits onto the group (the Red Hat arbitrary-UID idiom). This is applied
-# unconditionally because it targets a directory the app writes on every start;
-# the broader, opt-in USE_PERMISSION_HARDENING below covers the rest of /app.
-RUN chgrp -R 0 /app/backend/open_webui/static && \
-    chmod -R g=u /app/backend/open_webui/static
+# Precompile application bytecode without triggering import-time side effects.
+RUN python -m compileall -q -j 0 /app/backend/open_webui && \
+    find /app/backend/open_webui -type d -name __pycache__ \
+    -exec chown -R "$UID:$GID" {} +
 
 EXPOSE 8080
 

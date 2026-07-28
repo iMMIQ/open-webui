@@ -20,6 +20,10 @@ const config = {
 		// poll for new version name every 60 seconds (to trigger reload mechanic in +layout.svelte)
 		version: {
 			name: (() => {
+				if (process.env.APP_BUILD_HASH) {
+					return process.env.APP_BUILD_HASH;
+				}
+
 				try {
 					return child_process.execSync('git rev-parse HEAD').toString().trim();
 				} catch {
